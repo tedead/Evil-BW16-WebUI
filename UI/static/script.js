@@ -232,6 +232,40 @@ function updateConnectionStatus(connected) {
     }
 }
 
+// ---- Outbound command pacing ------------------------------------------
+// The ESP32 rejects any send_command sent within 100ms of the previous one
+// ("Rate limited - please wait."). Queue outgoing commands and drain them at
+// a fixed minimum gap so bursts (buttons, settings apply) never trip it.
+window.__uartQueue = window.__uartQueue || [];
+let __uartLastSend = 0;
+let __uartPumpTimer = null;
+const UART_MIN_GAP = 130; // ms, comfortably above the ESP32's 100ms gate
+
+function enqueueUART(commandJSON) {
+    window.__uartQueue.push(commandJSON);
+    pumpUARTQueue();
+}
+
+function pumpUARTQueue() {
+    if (__uartPumpTimer !== null) return;      // a send is already scheduled
+    if (!window.__uartQueue.length) return;
+    const wait = Math.max(0, UART_MIN_GAP - (Date.now() - __uartLastSend));
+    __uartPumpTimer = setTimeout(() => {
+        __uartPumpTimer = null;
+        if (!window.__uartQueue.length) return;
+        if (isConnected && uartConnection && uartConnection.readyState === WebSocket.OPEN) {
+            const msg = window.__uartQueue.shift();
+            uartConnection.send(msg);
+            __uartLastSend = Date.now();
+            appendToTerminal(`[UART SENT] ${msg}`);
+            if (window.__uartQueue.length) pumpUARTQueue();
+        } else {
+            window.__uartQueue = [];            // connection lost: drop stale commands
+            appendToTerminal('[ERROR] UART not connected');
+        }
+    }, wait);
+}
+
 function sendUARTCommand(command) {
     if (!command) {
         appendToTerminal('[ERROR] Cannot send empty command via UART');
@@ -247,18 +281,11 @@ function sendUARTCommand(command) {
     // Convert to JSON string
     const commandJSON = JSON.stringify(commandObj);
 
-    // Log the command being sent
-    //console.log("[DEBUG] Sending UART Command: " + commandJSON);
-
     if (isConnected && uartConnection) {
-        uartConnection.send(commandJSON);
-        appendToTerminal(`[UART SENT] ${commandJSON}`);
+        enqueueUART(commandJSON);               // paced send (see pumpUARTQueue)
     } else {
         appendToTerminal('[ERROR] UART not connected');
     }
-
-    // Additional debug log to track unexpected actions
-    //console.log("[DEBUG] Command sent, awaiting response...");
 }
 
 function toggleConnection() {
@@ -1983,18 +2010,11 @@ function sendUARTCommand(command) {
     // Convert to JSON string
     const commandJSON = JSON.stringify(commandObj);
 
-    // Log the command being sent
-    console.log("[DEBUG] Sending UART Command: " + commandJSON);
-
     if (isConnected && uartConnection) {
-        uartConnection.send(commandJSON);
-        appendToTerminal(`[UART SENT] ${commandJSON}`);
+        enqueueUART(commandJSON);               // paced send (see pumpUARTQueue)
     } else {
         appendToTerminal('[ERROR] UART not connected');
     }
-
-    // Additional debug log to track unexpected actions
-    console.log("[DEBUG] Command sent, awaiting response...");
 }
 
 function updateConnectionStatus(connected) {
