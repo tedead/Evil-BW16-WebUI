@@ -44,144 +44,6 @@ function appendToTerminal(data) {
     }
 }
 
-// ---- On-page Device Output console + Device Info panel ------------------
-// Parsed key/value snapshot from the BW16 'info'/'status' responses.
-window.deviceInfo = window.deviceInfo || {};
-
-// Append one line to the visible on-page console (#commandOutput), colored by
-// its log level, and keep it scrolled to the newest line and bounded in size.
-function appendToCommandOutput(text, levelClass) {
-    const out = document.getElementById('commandOutput');
-    if (!out) return;
-    // Drop the placeholder on first real line.
-    const placeholder = out.querySelector('.text-muted');
-    if (placeholder && out.children.length === 1) {
-        out.innerHTML = '';
-    }
-    const line = document.createElement('div');
-    line.className = 'command-output-line' + (levelClass ? ' ' + levelClass : '');
-    line.textContent = text;
-    out.appendChild(line);
-    // Cap at 500 lines to avoid unbounded growth during attacks/sniffing.
-    while (out.children.length > 500) {
-        out.removeChild(out.firstChild);
-    }
-    out.scrollTop = out.scrollHeight;
-}
-
-function clearCommandOutput() {
-    const out = document.getElementById('commandOutput');
-    if (out) {
-        out.innerHTML = '<div class="command-output-line text-muted">Responses from the BW16 appear here.</div>';
-    }
-}
-
-// A single serial_data message may carry several newline-separated lines
-// (the ESP32 forwards raw UART chunks), so split and handle each line.
-function renderSerialLine(rawMessage) {
-    if (rawMessage === undefined || rawMessage === null) return;
-    String(rawMessage).split(/\r?\n/).forEach((line) => {
-        const trimmed = line.trim();
-        if (!trimmed) return;
-        appendToCommandOutput(trimmed, levelClassFor(trimmed));
-        parseDeviceInfoLine(trimmed);
-    });
-}
-
-function levelClassFor(line) {
-    if (line.startsWith('[ERROR]')) return 'lvl-error';
-    if (line.startsWith('[CMD]')) return 'lvl-cmd';
-    if (line.startsWith('[UART SENT]') || line.startsWith('>')) return 'lvl-sent';
-    if (line.startsWith('[INFO]')) return 'lvl-info';
-    return '';
-}
-
-// Extract "Label: Value" pairs from [INFO] lines emitted by 'info'/'status'
-// and upsert them into the Device Info panel. Parsing only happens inside a
-// capture window opened by the "Current Configuration:" / "Current Status:"
-// headers and closed by the help/section headers or the next command echo, so
-// 'help' text (which also looks like "name : description") never leaks in.
-window.deviceInfoCapture = window.deviceInfoCapture || false;
-
-function parseDeviceInfoLine(line) {
-    let body = line;
-    const tag = body.match(/^\[[A-Z]+\]\s*/); // strip a leading [INFO]/[CMD]/... tag
-    if (tag) body = body.slice(tag[0].length);
-    body = body.trim();
-
-    // Open capture on an info/status header.
-    if (/^Current (Configuration|Status):/i.test(body)) {
-        window.deviceInfoCapture = true;
-        return;
-    }
-    // Close capture on help/section headers or when a new command is echoed.
-    if (/^(Available Commands:|WiFi Sniffer Commands:|Configuration Commands:|Received Command:)/i.test(body)) {
-        window.deviceInfoCapture = false;
-        return;
-    }
-    if (!window.deviceInfoCapture) return;
-
-    body = body.replace(/^-\s*/, '').trim();   // strip status' leading "- "
-    const idx = body.indexOf(':');
-    if (idx <= 0) return;
-    const label = body.slice(0, idx).trim();
-    const value = body.slice(idx + 1).trim();
-    if (!label || !value) return;              // skip headers like "Current Status:"
-    if (label.length > 40) return;             // guard against stray colons in free text
-
-    window.deviceInfo[label] = value;
-    renderDeviceInfoGrid();
-}
-
-function renderDeviceInfoGrid() {
-    const grid = document.getElementById('deviceInfoGrid');
-    if (!grid) return;
-    const keys = Object.keys(window.deviceInfo);
-    if (keys.length === 0) {
-        grid.innerHTML = '<div class="device-info-empty text-muted">No data yet — press <strong>Info</strong> or <strong>Status</strong> once connected.</div>';
-        return;
-    }
-    grid.innerHTML = keys.map((label) => {
-        const value = window.deviceInfo[label];
-        let valueClass = 'di-value';
-        if (/^(yes|on|enabled)$/i.test(value)) valueClass += ' di-yes';
-        else if (/^(no|off|disabled)$/i.test(value)) valueClass += ' di-no';
-        return `<div class="device-info-row">
-                    <span class="di-label">${escapeHtml(label)}</span>
-                    <span class="${valueClass}">${escapeHtml(value)}</span>
-                </div>`;
-    }).join('');
-
-    const updated = document.getElementById('deviceInfoUpdated');
-    if (updated) {
-        updated.textContent = 'Updated ' + new Date().toLocaleTimeString();
-    }
-}
-
-function escapeHtml(str) {
-    return String(str).replace(/[&<>"']/g, (c) => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }[c]));
-}
-
-function refreshDeviceInfo() {
-    if (!isConnected) {
-        appendToCommandOutput('[ERROR] Not connected to the BW16.', 'lvl-error');
-        return;
-    }
-    appendToCommandOutput('> info', 'lvl-sent');
-    sendCommand('info');
-}
-
-function refreshDeviceStatus() {
-    if (!isConnected) {
-        appendToCommandOutput('[ERROR] Not connected to the BW16.', 'lvl-error');
-        return;
-    }
-    appendToCommandOutput('> status', 'lvl-sent');
-    sendCommand('status');
-}
-
 function updateConnectionStatus(connected) {
     isConnected = connected;
     
@@ -556,7 +418,6 @@ document.addEventListener('DOMContentLoaded', function() {
         switch (data.type) {
             case 'serial_data':
                 appendToTerminal(data.message);
-                renderSerialLine(data.message);
                 break;
             case 'network_scan':
                 displayNetworks(data.networks);
@@ -820,46 +681,10 @@ function loadDashboard(container) {
             </div>
         </div>
 
-        <!-- Device Info & Status + live Device Output -->
-        <div class="row g-4 mt-1">
-            <div class="col-lg-5">
-                <div class="card h-100">
-                    <div class="card-body">
-                        <div class="d-flex justify-content-between align-items-center mb-3">
-                            <h5 class="card-title mb-0"><i class="bi bi-cpu me-2"></i>Device Info &amp; Status</h5>
-                            <div class="btn-group btn-group-sm">
-                                <button class="btn btn-dark" onclick="refreshDeviceInfo()" title="Send 'info'"><i class="bi bi-arrow-clockwise me-1"></i>Info</button>
-                                <button class="btn btn-dark" onclick="refreshDeviceStatus()" title="Send 'status'"><i class="bi bi-activity me-1"></i>Status</button>
-                            </div>
-                        </div>
-                        <div id="deviceInfoGrid" class="device-info-grid">
-                            <div class="device-info-empty text-muted">No data yet — press <strong>Info</strong> or <strong>Status</strong> once connected.</div>
-                        </div>
-                        <div id="deviceInfoUpdated" class="device-info-updated text-muted mt-2"></div>
-                    </div>
-                </div>
-            </div>
-            <div class="col-lg-7">
-                <div class="card h-100">
-                    <div class="card-body d-flex flex-column">
-                        <div class="d-flex justify-content-between align-items-center mb-3">
-                            <h5 class="card-title mb-0"><i class="bi bi-card-text me-2"></i>Device Output</h5>
-                            <button class="btn btn-sm btn-dark" onclick="clearCommandOutput()" title="Clear output"><i class="bi bi-trash me-1"></i>Clear</button>
-                        </div>
-                        <div id="commandOutput" class="command-output flex-grow-1">
-                            <div class="command-output-line text-muted">Responses from the BW16 appear here.</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
         <!-- Scan Results will be appended here -->
         <div id="scanResults" class="mt-4"></div>
     `;
-
-    // Re-render any device info we already collected (survives view switches).
-    renderDeviceInfoGrid();
+       
     // Update UI based on current connection status
     updateConnectionStatus(isConnected);
 }
@@ -1900,7 +1725,6 @@ function initUART() {
         switch (data.type) {
             case 'serial_data':
                 appendToTerminal(data.message);
-                renderSerialLine(data.message);
                 break;
             case 'network_scan':
                 displayNetworks(data.networks);
