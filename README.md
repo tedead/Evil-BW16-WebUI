@@ -31,6 +31,7 @@ A powerful WiFi deauthentication tool running on BW16 and ESP32 platforms, featu
    - [Development Environment Setup](#development-environment-setup-)
    - [BW16 Firmware Installation](#bw16-firmware-installation-)
    - [ESP32 Web Interface Installation](#esp32-web-interface-installation-)
+   - [Web UI Files on the SD Card](#web-ui-files-on-the-sd-card-)
 4. [Web Interface Usage](#web-interface-usage-)
 5. [Advanced Configuration](#advanced-configuration-)
    - [Command Reference](#command-reference-)
@@ -137,6 +138,46 @@ A powerful WiFi deauthentication tool running on BW16 and ESP32 platforms, featu
 
 ---
 
+### Web UI Files on the SD Card 💾
+
+The ESP32 serves the web interface **from the SD card** — it does not embed the
+UI in the sketch. The `UI/` folder must be copied to the root of a **FAT32**
+SD card, preserving the structure:
+
+```
+SD root/
+├── index.html          # from UI/index.html
+└── static/             # from UI/static/
+    ├── script.js
+    ├── style.css
+    ├── bootstrap.min.css
+    └── ... (fonts, logo, socket.io, etc.)
+```
+
+> If no SD card is present, the ESP32 falls back to a minimal built-in page and
+> the full interface will not appear.
+
+#### Updating after you change the code 🔄
+
+The three parts are flashed/copied independently — changing one does **not**
+update the others:
+
+| You changed…                         | To apply it…                                                        |
+| ------------------------------------ | ------------------------------------------------------------------- |
+| `UI/index.html` or `UI/static/*`     | Copy the changed files onto the SD card (same paths), then hard-refresh the browser (**Ctrl+F5**). No reflash needed. |
+| `Evil-BW16/Evil-BW16.ino` (firmware) | Recompile and **flash the BW16** (Arduino IDE Upload, or `arduino-cli`). The SD card is not involved. |
+| `ESP32/ESP32.ino`                    | Recompile and **flash the ESP32**.                                  |
+
+**Verify an update landed:**
+- *Web UI updated* → the dashboard shows the **Device Info & Status** and
+  **Device Output** cards below Quick Actions.
+- *BW16 firmware updated* → pressing **Info** fills that panel with the current
+  configuration, and `info`/`help` list the `attack_5ghz` option.
+- If the page looks new but the Info panel stays empty, the SD side is done but
+  the BW16 still needs reflashing.
+
+---
+
 ## Web Interface Usage 💡
 
 1. **Power on** the device (BW16 + ESP32).
@@ -213,6 +254,10 @@ To modify these settings:
   Enable/disable scan between cycles.
 - `set led <on/off>`  
   Enable/disable onboard LEDs.
+- `set attack_5ghz <on/off>`  
+  Allow raw deauth/disassoc injection on 5GHz APs (default **off**). 5GHz APs
+  are skipped during attacks unless this is enabled; 5GHz raw injection is
+  unreliable and may wedge the radio.
 - `set debug <on/off>`  
   Enable/disable debug mode.
 
