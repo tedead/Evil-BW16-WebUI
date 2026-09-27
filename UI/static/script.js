@@ -162,6 +162,7 @@ function parseDeviceInfoLine(line) {
     const value = body.slice(idx + 1).trim();
     if (!label || !value) return;              // skip headers like "Current Status:"
     if (label.length > 40) return;             // guard against stray colons in free text
+    if (/\s{2,}/.test(label)) return;          // reject column-padded rows (e.g. scan results)
 
     window.deviceInfo[label] = value;
     renderDeviceInfoGrid();
