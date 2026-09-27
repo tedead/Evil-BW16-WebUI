@@ -76,6 +76,40 @@ function clearCommandOutput() {
     }
 }
 
+// Device Output text color: chosen via the swatch picker and persisted to
+// localStorage so it survives reloads/power-cycles on this browser.
+const OUTPUT_COLOR_KEY = 'bw16.outputColor';
+const OUTPUT_COLOR_DEFAULT = '#93c5fd';
+
+function getSavedOutputColor() {
+    try { return localStorage.getItem(OUTPUT_COLOR_KEY) || OUTPUT_COLOR_DEFAULT; }
+    catch (e) { return OUTPUT_COLOR_DEFAULT; }
+}
+
+function saveOutputColor(color) {
+    try { localStorage.setItem(OUTPUT_COLOR_KEY, color); } catch (e) { /* private mode / blocked */ }
+}
+
+// Apply a color to the console text (lines use color:inherit, so setting the
+// container cascades) and sync the picker's displayed swatch.
+function applyOutputColor(color) {
+    const out = document.getElementById('commandOutput');
+    if (out) out.style.color = color;
+    const picker = document.getElementById('outputColorPicker');
+    if (picker && picker.value !== color) picker.value = color;
+}
+
+function onOutputColorChange(color) {
+    applyOutputColor(color);
+    saveOutputColor(color);
+}
+
+// Restore the saved color onto the current DOM (call after the dashboard is
+// (re)rendered, since that recreates #commandOutput and the picker).
+function initOutputColor() {
+    applyOutputColor(getSavedOutputColor());
+}
+
 // A single serial_data message may carry several newline-separated lines
 // (the ESP32 forwards raw UART chunks), so split and handle each line.
 function renderSerialLine(rawMessage) {
@@ -574,6 +608,8 @@ document.addEventListener('DOMContentLoaded', function() {
 document.addEventListener('DOMContentLoaded', function() {
     // Open the web shell when the page loads
     toggleTerminal();
+    // Restore the saved Device Output text color for the static-HTML layout.
+    initOutputColor();
 });
 
 function fetchDeviceInfo() {
@@ -844,7 +880,10 @@ function loadDashboard(container) {
                     <div class="card-body d-flex flex-column">
                         <div class="d-flex justify-content-between align-items-center mb-3">
                             <h5 class="card-title mb-0"><i class="bi bi-card-text me-2"></i>Device Output</h5>
-                            <button class="btn btn-sm btn-dark" onclick="clearCommandOutput()" title="Clear output"><i class="bi bi-trash me-1"></i>Clear</button>
+                            <div class="d-flex align-items-center gap-2">
+                                <input type="color" id="outputColorPicker" class="output-color-picker" value="#93c5fd" oninput="onOutputColorChange(this.value)" title="Text color">
+                                <button class="btn btn-sm btn-dark" onclick="clearCommandOutput()" title="Clear output"><i class="bi bi-trash me-1"></i>Clear</button>
+                            </div>
                         </div>
                         <div id="commandOutput" class="command-output flex-grow-1">
                             <div class="command-output-line text-muted">Responses from the BW16 appear here.</div>
@@ -860,6 +899,8 @@ function loadDashboard(container) {
 
     // Re-render any device info we already collected (survives view switches).
     renderDeviceInfoGrid();
+    // Restore the saved Device Output text color onto the freshly-built DOM.
+    initOutputColor();
     // Update UI based on current connection status
     updateConnectionStatus(isConnected);
 }
